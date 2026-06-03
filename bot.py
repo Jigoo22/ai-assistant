@@ -256,10 +256,10 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
     msg  = update.message
     text = msg.text or msg.caption or ""
-    if msg.forward_from:
-        text = f"[Переслано от {msg.forward_from.full_name}]\n{text}"
-    elif msg.forward_sender_name:
-        text = f"[Переслано от {msg.forward_sender_name}]\n{text}"
+  origin = getattr(msg, 'forward_origin', None)
+    if origin:
+        name = getattr(origin, 'sender_name', None) or getattr(getattr(origin, 'sender_user', None), 'full_name', None) or 'неизвестно'
+        text = f"[Переслано от {name}]\n{text}"
     if not text.strip(): return
 
     thinking = await msg.reply_text("🤔 Анализирую...")
