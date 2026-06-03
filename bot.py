@@ -254,13 +254,13 @@ async def cmd_addproject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
-    msg  = update.message
-    text = msg.text or msg.caption or ""
-    if msg.forward_from:
-        text = f"[Переслано от {msg.forward_from.full_name}]\n{text}"
-    elif msg.forward_sender_name:
-        text = f"[Переслано от {msg.forward_sender_name}]\n{text}"
-    if not text.strip(): return
+    try:
+        origin = msg.forward_origin
+        name = getattr(origin, "sender_name", "") or getattr(getattr(origin, "sender_user", None), "full_name", "") or ""
+        if name:
+            text = f"[Переслано от {name}]\n{text}"
+    except AttributeError:
+        pass
 
     thinking = await msg.reply_text("🤔 Анализирую...")
     try:
