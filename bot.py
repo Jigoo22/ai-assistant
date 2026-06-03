@@ -1,183 +1,217 @@
 """
-AI Personal Assistant Bot
-Получает сообщения из Telegram (переброшенные из WhatsApp через MacroDroid),
-анализирует через Claude, создаёт задачи в tasks.json
+AI Personal Assistant Bot v2
+- Анализирует сообщения через Claude
+- Если проект не определён — спрашивает через inline-кнопки
+- Поддерживает голосовые, фото, текст
 """
 
 import os
 import json
 import logging
-import asyncio
 import tempfile
 from datetime import datetime
 from pathlib import Path
 
 import anthropic
-from telegram import Update, Message
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    filters, ContextTypes
+    CallbackQueryHandler, filters, ContextTypes
 )
 
 # ── Конфиг ────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]       # токен от @BotFather
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]   # ключ Anthropic
-ALLOWED_USER_ID  = int(os.environ.get("ALLOWED_USER_ID", 0))  # ваш Telegram user_id
-TASKS_FILE       = Path(os.environ.get("TASKS_FILE", "tasks.json"))
-PROJECTS_FILE    = Path(os.environ.get("PROJECTS_FILE", "projects.json"))
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+ALLOWED_USER_ID   = int(os.environ.get("ALLOWED_USER_ID", 0))
+TASKS_FILE        = Path(os.environ.get("TASKS_FILE", "tasks.json"))
+PROJECTS_FILE     = Path(os.environ.get("PROJECTS_FILE", "projects.json"))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ── Хранилище задач ───────────────────────────────────────────────
-def load_json(path: Path, default):
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return default
+# ── Хранилище ─────────────────────────────────────────────────────
+def load_json(path, default):
+    return json.loads(path.read_text("utf-8")) if path.exists() else default
 
-def save_json(path: Path, data):
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+def save_json(path, data):
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
 
-def get_tasks():   return load_json(TASKS_FILE,    [])
-def get_projects():return load_json(PROJECTS_FILE, [
-    {"id": 1, "name": "Общее", "color": "var(--accent)"},
-])
+def get_tasks():    return load_json(TASKS_FILE, [])
+def get_projects(): return load_json(PROJECTS_FILE, [{"id": 0, "name": "Общее", "color": "var(--blue)"}])
 
 def save_task(task: dict):
-    tasks = get_tasks()
-    task["id"] = max((t["id"] for t in tasks), default=0) + 1
-    task["done"] = False
-    task["comments"] = []
-    task["created_at"] = datetime.now().isoformat()
+    tasks  = get_tasks()
+    new_id = max((t["id"] for t in tasks), default=0) + 1
+    task.update({"id": new_id, "done": False, "comments": [], "created_at": datetime.now().isoformat()})
     tasks.append(task)
     save_json(TASKS_FILE, tasks)
     return task
 
+def save_project(name: str, color: str = "var(--accent)"):
+    projects = get_projects()
+    new_id   = max((p["id"] for p in projects), default=0) + 1
+    project  = {"id": new_id, "name": name, "color": color}
+    projects.append(project)
+    save_json(PROJECTS_FILE, projects)
+    return project
+
+# ── Pending tasks (ждут выбора проекта) ──────────────────────────
+# { message_id: [task_dict, ...] }
+pending: dict[int, list] = {}
+
 # ── Проверка доступа ──────────────────────────────────────────────
 def is_allowed(update: Update) -> bool:
-    if not ALLOWED_USER_ID:
-        return True   # если не задан — разрешаем всем (только для теста!)
-    return update.effective_user.id == ALLOWED_USER_ID
+    if not ALLOWED_USER_ID: return True
+    uid = update.effective_user.id if update.effective_user else None
+    return uid == ALLOWED_USER_ID
 
-# ── Claude: анализ текста ─────────────────────────────────────────
-SYSTEM_PROMPT = """Ты — личный AI-помощник. Анализируешь сообщения пользователя
-(переписку, голосовые, заметки) и извлекаешь задачи, договорённости и напоминания.
+# ── Системный промпт ──────────────────────────────────────────────
+def build_system_prompt() -> str:
+    projects = get_projects()
+    proj_list = "\n".join(f'  {p["id"]}: "{p["name"]}"' for p in projects)
+    return f"""Ты — личный AI-помощник. Анализируешь сообщения и извлекаешь задачи.
 
-Отвечай ТОЛЬКО JSON в формате:
-{
+Доступные проекты:
+{proj_list}
+
+Отвечай ТОЛЬКО валидным JSON:
+{{
   "tasks": [
-    {
-      "text": "краткое название задачи",
+    {{
+      "text": "краткое название задачи (до 80 символов)",
       "priority": "high|med|low",
       "deadline": "YYYY-MM-DD или null",
       "source": "msg|call|audio|photo",
-      "pid": 1,
-      "note": "краткий контекст откуда задача (1 предложение)"
-    }
+      "pid": <id проекта или null если не ясно>,
+      "note": "1 предложение — контекст"
+    }}
   ],
-  "summary": "одно предложение — о чём было сообщение"
-}
+  "summary": "одно предложение о чём сообщение"
+}}
 
 Правила:
-- priority=high если есть слова: срочно, сегодня, завтра, горит, важно, асап
-- Извлекай только реальные задачи — не общие фразы
-- Если задач нет — tasks: []
-- deadline только если явно указана дата или "до пятницы" / "на следующей неделе" и т.д.
-- Всегда отвечай на русском"""
+- priority=high если: срочно, сегодня, завтра, горит, важно, ASAP
+- pid=null если не можешь уверенно определить проект
+- Извлекай только реальные задачи, не общие фразы
+- deadline только если явно упомянута дата или "до пятницы" и т.п.
+- Отвечай на русском"""
 
+# ── Анализ ────────────────────────────────────────────────────────
 async def analyze_text(text: str, source: str = "msg") -> dict:
-    """Отправляет текст в Claude, получает структурированные задачи."""
-    response = client.messages.create(
+    resp = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1000,
-        system=SYSTEM_PROMPT,
+        system=build_system_prompt(),
         messages=[{"role": "user", "content": f"[Источник: {source}]\n\n{text}"}]
     )
-    raw = response.content[0].text.strip()
-    # убираем markdown-блоки если Claude завернул
-    raw = raw.replace("```json", "").replace("```", "").strip()
+    raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
     return json.loads(raw)
 
 async def analyze_audio(file_bytes: bytes, source: str = "audio") -> dict:
-    """Транскрибирует аудио через Whisper, затем анализирует текст."""
-    # Сохраняем временный файл
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
+        tmp.write(file_bytes); tmp_path = tmp.name
     try:
         import openai
-        oai = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
-        with open(tmp_path, "rb") as f:
+        oai = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY",""))
+        with open(tmp_path,"rb") as f:
             transcript = oai.audio.transcriptions.create(model="whisper-1", file=f)
         text = transcript.text
-        log.info(f"Транскрипция: {text[:100]}...")
         result = await analyze_text(text, source)
         result["transcript"] = text
         return result
     except Exception as e:
         log.error(f"Ошибка транскрипции: {e}")
-        return {"tasks": [], "summary": f"Ошибка обработки аудио: {e}", "transcript": ""}
+        return {"tasks":[], "summary": f"Ошибка аудио: {e}"}
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
 async def analyze_image(file_bytes: bytes) -> dict:
-    """Анализирует изображение через Claude Vision."""
     import base64
     b64 = base64.standard_b64encode(file_bytes).decode()
-    response = client.messages.create(
+    resp = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1000,
-        system=SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
-                {"type": "text",  "text": "[Источник: photo] Извлеки задачи из этого изображения (скриншот переписки, документ, заметка и т.д.)"}
-            ]
-        }]
+        system=build_system_prompt(),
+        messages=[{"role":"user","content":[
+            {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":b64}},
+            {"type":"text","text":"[Источник: photo] Извлеки задачи из изображения"}
+        ]}]
     )
-    raw = response.content[0].text.strip().replace("```json","").replace("```","").strip()
+    raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
     return json.loads(raw)
 
-# ── Форматирование ответа ─────────────────────────────────────────
-PRIORITY_EMOJI = {"high": "🔴", "med": "🟡", "low": "🔵"}
-SOURCE_LABEL   = {"msg": "💬 Сообщение", "call": "📞 Звонок",
-                  "audio": "🎤 Голосовое", "photo": "🖼 Фото"}
+# ── Форматирование ────────────────────────────────────────────────
+PRIORITY_EMOJI = {"high":"🔴","med":"🟡","low":"🔵"}
+SOURCE_LABEL   = {"msg":"💬","call":"📞","audio":"🎤","photo":"🖼"}
 
-def format_tasks_reply(result: dict) -> str:
+def format_task_line(t: dict) -> str:
+    p  = PRIORITY_EMOJI.get(t.get("priority","med"),"🟡")
+    dl = f" · до {t['deadline']}" if t.get("deadline") else ""
+    return f"{p} *{t['text']}*{dl}"
+
+def project_keyboard(exclude_pid=None) -> InlineKeyboardMarkup:
+    """Кнопки выбора проекта + кнопка создать новый."""
+    projects = get_projects()
+    buttons  = []
+    row      = []
+    for p in projects:
+        if p["id"] == exclude_pid: continue
+        row.append(InlineKeyboardButton(p["name"], callback_data=f"proj:{p['id']}"))
+        if len(row) == 2:
+            buttons.append(row); row = []
+    if row: buttons.append(row)
+    buttons.append([InlineKeyboardButton("➕ Новый проект", callback_data="proj:new")])
+    return InlineKeyboardMarkup(buttons)
+
+# ── Обработка результата анализа ──────────────────────────────────
+async def process_result(result: dict, msg, source: str = "msg"):
+    """Сохраняет задачи с известным проектом, спрашивает по остальным."""
     tasks   = result.get("tasks", [])
-    summary = result.get("summary", "")
-    lines   = [f"📋 *{summary}*\n"] if summary else []
+    summary = result.get("summary","")
 
     if not tasks:
-        lines.append("Задач не найдено.")
-        return "\n".join(lines)
+        await msg.reply_text(f"📋 _{summary}_\n\nЗадач не найдено.", parse_mode="Markdown")
+        return
 
-    lines.append(f"Создано задач: *{len(tasks)}*\n")
-    for t in tasks:
-        p = PRIORITY_EMOJI.get(t.get("priority","med"), "🟡")
-        dl = f" · до {t['deadline']}" if t.get("deadline") else ""
-        lines.append(f"{p} *{t['text']}*{dl}")
-        if t.get("note"):
-            lines.append(f"   _{t['note']}_")
-    return "\n".join(lines)
+    # Задачи с определённым проектом — сохраняем сразу
+    saved   = [t for t in tasks if t.get("pid") is not None]
+    unclear = [t for t in tasks if t.get("pid") is None]
 
-# ── Хэндлеры ─────────────────────────────────────────────────────
+    lines = [f"📋 _{summary}_\n"] if summary else []
+
+    for t in saved:
+        save_task(t)
+        proj = next((p["name"] for p in get_projects() if p["id"]==t.get("pid")), "Общее")
+        lines.append(format_task_line(t))
+        lines.append(f"   📁 {proj}\n")
+
+    if saved:
+        await msg.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    # Задачи без проекта — спрашиваем по одной
+    for t in unclear:
+        t["source"] = source
+        sent = await msg.reply_text(
+            f"🤔 В какой проект добавить?\n\n{format_task_line(t)}",
+            parse_mode="Markdown",
+            reply_markup=project_keyboard()
+        )
+        pending[sent.message_id] = t
+
+# ── Хэндлеры сообщений ────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
     uid = update.effective_user.id
     await update.message.reply_text(
-        f"👋 AI-помощник запущен!\n\n"
+        f"👋 *AI-помощник запущен!*\n\n"
         f"Твой User ID: `{uid}`\n\n"
-        f"Пересылай мне сообщения из WhatsApp, голосовые, фото — "
-        f"я буду создавать задачи автоматически.\n\n"
-        f"/tasks — список активных задач\n"
-        f"/projects — список проектов",
+        f"Пересылай сообщения из WhatsApp, голосовые, фото — "
+        f"я создам задачи и уточню проект если не пойму.\n\n"
+        f"/tasks — активные задачи\n"
+        f"/projects — список проектов\n"
+        f"/addproject — добавить проект",
         parse_mode="Markdown"
     )
 
@@ -185,13 +219,18 @@ async def cmd_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
     tasks = [t for t in get_tasks() if not t.get("done")]
     if not tasks:
-        await update.message.reply_text("✅ Нет активных задач!")
-        return
+        await update.message.reply_text("✅ Нет активных задач!"); return
+    projects = {p["id"]: p["name"] for p in get_projects()}
     lines = [f"📋 *Активные задачи ({len(tasks)}):*\n"]
-    for t in tasks[:15]:  # максимум 15 в сообщении
+    cur_pid = -1
+    for t in sorted(tasks, key=lambda x: x.get("pid") or 0):
+        pid = t.get("pid") or 0
+        if pid != cur_pid:
+            lines.append(f"\n📁 *{projects.get(pid,'Общее')}*")
+            cur_pid = pid
         p = PRIORITY_EMOJI.get(t.get("priority","med"),"🟡")
-        lines.append(f"{p} {t['text']}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        lines.append(f"  {p} {t['text']}")
+    await update.message.reply_text("\n".join(lines[:30]), parse_mode="Markdown")
 
 async def cmd_projects(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
@@ -203,109 +242,170 @@ async def cmd_projects(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• *{p['name']}* — {count} задач")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Текстовое сообщение или пересланное из WA."""
+async def cmd_addproject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
-    msg   = update.message
-    text  = msg.text or msg.caption or ""
-    # Для пересланных — добавляем имя отправителя если есть
+    args = ctx.args
+    if not args:
+        await update.message.reply_text(
+            "Используйте: `/addproject Название проекта`", parse_mode="Markdown"); return
+    name    = " ".join(args)
+    project = save_project(name)
+    await update.message.reply_text(f"✅ Проект *{name}* создан (id: {project['id']})", parse_mode="Markdown")
+
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update): return
+    msg  = update.message
+    text = msg.text or msg.caption or ""
     if msg.forward_from:
-        name = msg.forward_from.full_name
-        text = f"[Переслано от {name}]\n{text}"
+        text = f"[Переслано от {msg.forward_from.full_name}]\n{text}"
     elif msg.forward_sender_name:
         text = f"[Переслано от {msg.forward_sender_name}]\n{text}"
-    if not text.strip():
-        return
+    if not text.strip(): return
 
     thinking = await msg.reply_text("🤔 Анализирую...")
     try:
         result = await analyze_text(text, "msg")
-        for task in result.get("tasks", []):
-            save_task(task)
-        await thinking.edit_text(format_tasks_reply(result), parse_mode="Markdown")
+        await thinking.delete()
+        await process_result(result, msg, "msg")
     except Exception as e:
         log.error(e)
         await thinking.edit_text(f"❌ Ошибка: {e}")
 
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Голосовое сообщение (войс из WA или Telegram)."""
     if not is_allowed(update): return
     msg  = update.message
     file = await (msg.voice or msg.audio).get_file()
-
-    thinking = await msg.reply_text("🎤 Транскрибирую аудио...")
+    thinking = await msg.reply_text("🎤 Транскрибирую...")
     try:
         file_bytes = await file.download_as_bytearray()
         result     = await analyze_audio(bytes(file_bytes), "audio")
         if result.get("transcript"):
-            await msg.reply_text(f"📝 Текст: _{result['transcript']}_", parse_mode="Markdown")
-        for task in result.get("tasks", []):
-            save_task(task)
-        await thinking.edit_text(format_tasks_reply(result), parse_mode="Markdown")
+            await msg.reply_text(f"📝 _{result['transcript']}_", parse_mode="Markdown")
+        await thinking.delete()
+        await process_result(result, msg, "audio")
     except Exception as e:
         log.error(e)
         await thinking.edit_text(f"❌ Ошибка: {e}")
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Фото — скриншот переписки, документ, фото доски."""
     if not is_allowed(update): return
-    msg  = update.message
-    photo = msg.photo[-1]  # берём наибольшее разрешение
+    msg   = update.message
+    photo = msg.photo[-1]
     file  = await photo.get_file()
-
-    thinking = await msg.reply_text("🖼 Анализирую изображение...")
+    thinking = await msg.reply_text("🖼 Анализирую фото...")
     try:
         file_bytes = await file.download_as_bytearray()
         result     = await analyze_image(bytes(file_bytes))
-        for task in result.get("tasks", []):
-            save_task(task)
-        await thinking.edit_text(format_tasks_reply(result), parse_mode="Markdown")
+        await thinking.delete()
+        await process_result(result, msg, "photo")
     except Exception as e:
         log.error(e)
         await thinking.edit_text(f"❌ Ошибка: {e}")
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Документ (PDF, аудиофайл из WA приходит как document)."""
     if not is_allowed(update): return
     msg  = update.message
     doc  = msg.document
     mime = doc.mime_type or ""
-
-    if "audio" in mime or doc.file_name.endswith((".ogg",".mp3",".m4a",".opus")):
-        # Аудиофайл из WhatsApp приходит как document
-        file       = await doc.get_file()
-        thinking   = await msg.reply_text("🎤 Обрабатываю аудио из WA...")
-        file_bytes = await file.download_as_bytearray()
+    if "audio" in mime or (doc.file_name or "").endswith((".ogg",".mp3",".m4a",".opus")):
+        file     = await doc.get_file()
+        thinking = await msg.reply_text("🎤 Обрабатываю аудио...")
         try:
-            result = await analyze_audio(bytes(file_bytes), "audio")
+            file_bytes = await file.download_as_bytearray()
+            result     = await analyze_audio(bytes(file_bytes), "audio")
             if result.get("transcript"):
-                await msg.reply_text(f"📝 Текст: _{result['transcript']}_", parse_mode="Markdown")
-            for task in result.get("tasks", []):
-                save_task(task)
-            await thinking.edit_text(format_tasks_reply(result), parse_mode="Markdown")
+                await msg.reply_text(f"📝 _{result['transcript']}_", parse_mode="Markdown")
+            await thinking.delete()
+            await process_result(result, msg, "audio")
         except Exception as e:
             await thinking.edit_text(f"❌ Ошибка: {e}")
     else:
-        await msg.reply_text("📎 Документы пока не поддерживаются. Пришли текст или изображение.")
+        await msg.reply_text("📎 Пришли текст, голосовое или фото.")
+
+# ── Callback: выбор проекта ───────────────────────────────────────
+async def handle_project_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_allowed(update): return
+
+    data   = query.data           # "proj:5" или "proj:new"
+    msg_id = query.message.message_id
+    task   = pending.get(msg_id)
+
+    if not task:
+        await query.edit_message_text("⚠️ Задача не найдена (устарела).")
+        return
+
+    if data == "proj:new":
+        # Просим написать название нового проекта
+        ctx.user_data["awaiting_project_for"] = msg_id
+        await query.edit_message_text(
+            f"Введите название нового проекта для задачи:\n\n"
+            f"_{task['text']}_",
+            parse_mode="Markdown"
+        )
+        return
+
+    pid = int(data.split(":")[1])
+    task["pid"] = pid
+    saved = save_task(task)
+    pending.pop(msg_id, None)
+
+    proj_name = next((p["name"] for p in get_projects() if p["id"]==pid), "Общее")
+    p_emoji   = PRIORITY_EMOJI.get(task.get("priority","med"),"🟡")
+    await query.edit_message_text(
+        f"✅ Задача сохранена!\n\n"
+        f"{p_emoji} *{task['text']}*\n"
+        f"📁 {proj_name}",
+        parse_mode="Markdown"
+    )
+
+async def handle_new_project_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ловим текст когда ждём название нового проекта."""
+    if not is_allowed(update): return
+    msg_id = ctx.user_data.get("awaiting_project_for")
+    if not msg_id: return  # не ждём — передаём обычному хэндлеру
+
+    name    = update.message.text.strip()
+    project = save_project(name)
+    task    = pending.get(msg_id)
+
+    if task:
+        task["pid"] = project["id"]
+        save_task(task)
+        pending.pop(msg_id, None)
+
+    ctx.user_data.pop("awaiting_project_for", None)
+    p_emoji = PRIORITY_EMOJI.get(task.get("priority","med"),"🟡") if task else "🟡"
+    await update.message.reply_text(
+        f"✅ Проект *{name}* создан и задача сохранена!\n\n"
+        f"{p_emoji} *{task['text'] if task else ''}*",
+        parse_mode="Markdown"
+    )
 
 # ── Запуск ────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("tasks",    cmd_tasks))
-    app.add_handler(CommandHandler("projects", cmd_projects))
+    app.add_handler(CommandHandler("start",      cmd_start))
+    app.add_handler(CommandHandler("tasks",      cmd_tasks))
+    app.add_handler(CommandHandler("projects",   cmd_projects))
+    app.add_handler(CommandHandler("addproject", cmd_addproject))
+    app.add_handler(CallbackQueryHandler(handle_project_choice, pattern=r"^proj:"))
 
-    # текст и пересылки
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    # голосовые
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO,   handle_voice))
-    # фото
-    app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
-    # документы (аудио из WA)
-    app.add_handler(MessageHandler(filters.Document.ALL,            handle_document))
+    # Сначала проверяем — не ждём ли название проекта
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        lambda u, c: handle_new_project_name(u, c)
+        if c.user_data.get("awaiting_project_for")
+        else handle_text(u, c)
+    ))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+    app.add_handler(MessageHandler(filters.PHOTO,                  handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL,           handle_document))
 
-    log.info("Бот запущен. Ожидаю сообщения...")
+    log.info("Бот v2 запущен.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
